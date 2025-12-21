@@ -34,6 +34,20 @@ Q-CYO_PYTHON_PROJECT/
 └── README.md                   # Project documentation
 ```
 
+
+### Structure Explanation
+
+- **api/** – Exposes the REST API used by Flutter  
+- **data/** – Raw and processed datasets  
+- **engine/** – Combines ML, optimization, and rules  
+- **models/** – Prediction, risk analysis, optimization logic  
+- **saved_models/** – Stored trained models  
+- **utils/** – Data loading and preprocessing  
+- **train_model.py** – Trains the ML model  
+- **main.py** – Local CLI testing  
+- **requirements.txt** – Dependencies  
+
+
 ## Setup
 
 Install dependencies:
