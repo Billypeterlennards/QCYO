@@ -4,22 +4,34 @@ Quantum Crop Yield Optimizer (Q-CYO) is a Python backend that uses machine learn
 It exposes a REST API used by a Flutter application (Web, Android, Windows, iOS).
 
 ---
+## 📁 Project Structure
 
-### Structure Explanation (Brief)
-
-- **api/** – Exposes the REST API used by Flutter  
-- **data/** – Raw and processed datasets  
-- **engine/** – Combines ML, optimization, and rules  
-- **models/** – Prediction, risk analysis, optimization logic  
-- **saved_models/** – Stored trained models  
-- **utils/** – Data loading and preprocessing  
-- **train_model.py** – Trains the ML model  
-- **main.py** – Local CLI testing  
-- **requirements.txt** – Dependencies  
-
+Q-CYO_PYTHON_PROJECT/
+│
+├── api/
+│ └── app.py # Flask API entry point
+│
+├── data/ # Crop yield datasets
+│
+├── engine/
+│ └── recommendation_engine.py # Core recommendation logic
+│
+├── models/
+│ ├── yield_model.py # ML yield prediction model
+│ ├── weather_risk.py # Weather risk assessment
+│ └── quantum_optimizer.py # Fertilizer optimization logic
+│
+├── saved_models/
+│ └── yield_model.pkl # Trained ML model
+│
+├── utils/
+│ └── preprocess.py # Data preprocessing utilities
+│
+├── train_model.py # Train and save ML model
+├── main.py # CLI testing and debugging
+├── requirements.txt # Python dependencies
+└── README.md # Project documentation
 ---
-
-
 
 ## Setup
 
