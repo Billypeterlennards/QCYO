@@ -1,4 +1,4 @@
-﻿# engine/recommendation_engine.py
+# engine/recommendation_engine.py
 import sys
 import os
 import random
@@ -172,18 +172,32 @@ def optimize_with_quantum(predicted_yield, soil_type, crop_type,
     """
     print("🔮 Using quantum-inspired optimization algorithm")
     
-    # Base requirements based on crop
+    # Base requirements based on crop (kg/ha of N/P/K at reference yield)
+    # NOTE: previously only covered maize/wheat/rice; barley/sorghum/soybean/cotton
+    # silently fell back to a generic default, which understated their real
+    # nutrient needs (soybean in particular fixes its own N and needs far less).
     crop_nutrients = {
         'maize': {'N': 180, 'P': 80, 'K': 120},
         'wheat': {'N': 150, 'P': 70, 'K': 100},
-        'rice': {'N': 160, 'P': 75, 'K': 110}
+        'rice': {'N': 160, 'P': 75, 'K': 110},
+        'barley': {'N': 130, 'P': 65, 'K': 90},
+        'sorghum': {'N': 140, 'P': 60, 'K': 100},
+        'soybean': {'N': 40, 'P': 90, 'K': 130},  # legume: fixes own nitrogen
+        'cotton': {'N': 170, 'P': 85, 'K': 150},
     }
-    
-    # Soil adjustments
+
+    # Soil adjustments. Previously missing 'silt'/'silty'/'loam' meant these
+    # soil types silently used the neutral 1.0 default instead of a realistic
+    # factor, even though the Flutter UI and API validator both accept them.
     soil_factors = {
         'sandy': {'N': 1.3, 'P': 1.4, 'K': 1.2},
         'loamy': {'N': 1.0, 'P': 1.0, 'K': 1.0},
-        'clay': {'N': 0.9, 'P': 0.8, 'K': 0.9}
+        'loam': {'N': 1.0, 'P': 1.0, 'K': 1.0},  # alias for loamy
+        'clay': {'N': 0.9, 'P': 0.8, 'K': 0.9},
+        'silt': {'N': 1.05, 'P': 1.05, 'K': 1.0},
+        'silty': {'N': 1.05, 'P': 1.05, 'K': 1.0},
+        'peaty': {'N': 0.75, 'P': 1.1, 'K': 0.9},
+        'chalky': {'N': 1.15, 'P': 1.2, 'K': 1.1},
     }
     
     # Environmental factors
@@ -226,7 +240,9 @@ def optimize_with_quantum(predicted_yield, soil_type, crop_type,
         temperature_param = 100.0
         best_solution = optimized_npk.copy()
         best_cost = total_cost
-        budget_scale = budget / total_cost
+        # Guard against total_cost == 0 (degenerate case: zero predicted yield),
+        # which previously caused a ZeroDivisionError and crashed the request.
+        budget_scale = (budget / total_cost) if total_cost > 0 else 1.0
         
         # Try multiple iterations to find optimal solution within budget
         for iteration in range(20):
