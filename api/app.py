@@ -317,8 +317,6 @@ def recommend_batch():
 
 @app.route('/health', methods=['GET'])
 def health():
-    from engine.recommendation_engine import RecommendationEngine
-    
     engine = RecommendationEngine()
     test_result = engine.get_recommendation(120, 26, 'sandy', 'maize', 1.0)
     
@@ -479,12 +477,19 @@ def method_not_allowed(error):
     }), 405
 
 if __name__ == '__main__':
+    # Debug mode must never be hardcoded True: Flask's debug mode exposes the
+    # interactive Werkzeug debugger, which allows arbitrary code execution to
+    # anyone who can reach an unhandled exception. Default to OFF; opt in
+    # explicitly with FLASK_DEBUG=1 for local development.
+    debug_mode = os.environ.get('FLASK_DEBUG', '0') == '1'
+    port = int(os.environ.get('PORT', 5000))
+
     print('\n' + '='*60)
     print('🚀 QUANTUM CROP YIELD OPTIMIZER API')
     print('='*60)
-    print('📡 Starting server on http://0.0.0.0:5000')
-    print('📚 API Documentation: http://localhost:5000')
-    print('🏥 Health check: http://localhost:5000/health')
+    print(f'📡 Starting server on http://0.0.0.0:{port} (debug={debug_mode})')
+    print(f'📚 API Documentation: http://localhost:{port}')
+    print(f'🏥 Health check: http://localhost:{port}/health')
     print('='*60 + '\n')
-    
-    app.run(host='0.0.0.0', port=5000, debug=True)
+
+    app.run(host='0.0.0.0', port=port, debug=debug_mode)
