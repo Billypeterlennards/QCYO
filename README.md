@@ -58,9 +58,7 @@ Q-CYO_PYTHON_PROJECT/
 ├── engine/
 │   └── recommendation_engine.py
 ├── models/
-│   ├── yield_model.py
-│   ├── weather_risk.py
-│   └── quantum_optimizer.py
+│   └── yield_model.py
 ├── saved_models/
 │   └── yield_model.pkl
 ├── utils/
@@ -150,7 +148,7 @@ http://127.0.0.1:5000
   "yield_per_hectare": 12.46,
   "total_yield": 62.3,
   "fertilizer_kg_per_ha": 292,
-  "weather_risk": "LOW"
+  "weather_risk_level": "LOW"
 }
 ```
 

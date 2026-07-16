@@ -1,6 +1,8 @@
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 import sys
 import os
 import logging
@@ -19,6 +21,21 @@ from engine.recommendation_engine import RecommendationEngine
 
 app = Flask(__name__)
 CORS(app)
+
+# BEFORE: no rate limiting existed anywhere in the API. Any client could
+# call /recommend/batch (up to 50 items processed server-side per call)
+# in an unbounded loop with zero throttling - a trivial DoS vector, and
+# /clear-cache could be spammed by anyone to wipe the shared cache for
+# every user. Defaults are generous for legitimate use but bound the worst
+# case; tune per your actual traffic patterns and consider a shared
+# backend (e.g. Redis) instead of in-memory storage once you run more than
+# one worker process.
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    default_limits=["200 per hour", "30 per minute"],
+    storage_uri="memory://",
+)
 
 # In-memory cache for performance
 recommendation_cache = {}
@@ -98,6 +115,30 @@ def validate_input(data, required_fields):
 def get_cache_key(params):
     return f'{params.get("rainfall")}_{params.get("temperature")}_{params.get("soil_type")}_{params.get("crop_type")}_{params.get("area")}'
 
+# BEFORE: /recommend/advanced, /recommend/simple, and /recommend/batch each
+# did their own raw `float(data.get(...))` extraction with ZERO range or
+# whitelist validation - meaning rainfall=999999999, a garbage soil_type
+# string, or a negative area could reach the recommendation engine directly,
+# completely bypassing the InputValidator that /recommend uses. Any endpoint
+# that accepts user input now goes through this same shared validator.
+STANDARD_FIELDS = {
+    'rainfall': InputValidator.validate_rainfall,
+    'temperature': InputValidator.validate_temperature,
+    'soil_type': InputValidator.validate_soil_type,
+    'crop_type': InputValidator.validate_crop_type,
+    'area': InputValidator.validate_area,
+}
+
+def validate_recommendation_input(data, defaults=None):
+    """Validate the 5 standard recommendation fields, applying defaults for
+    any that are missing (used by endpoints where fields are optional),
+    then running every value - including defaults - through the same
+    range/whitelist checks as /recommend.
+    """
+    defaults = defaults or {}
+    merged = {**defaults, **(data or {})}
+    return validate_input(merged, STANDARD_FIELDS)
+
 def cleanup_cache():
     global recommendation_cache
     if len(recommendation_cache) > MAX_CACHE_SIZE:
@@ -169,7 +210,6 @@ def recommend():
         logger.error(f'Error in /recommend: {str(e)}', exc_info=True)
         return jsonify({
             'error': 'Internal server error',
-            'message': str(e),
             'status': 'error'
         }), 500
 
@@ -177,42 +217,46 @@ def recommend():
 def recommend_advanced():
     request_counter['total'] += 1
     request_counter['advanced'] += 1
-    
+
     try:
         data = request.get_json()
         if not data:
             return jsonify({'error': 'No JSON data provided', 'status': 'error'}), 400
-        
-        r = float(data.get('rainfall', 120))
-        t = float(data.get('temperature', 26))
-        s = data.get('soil_type', 'sandy').lower()
-        c = data.get('crop_type', 'maize').lower()
-        a = float(data.get('area', 5))
-        
-        if a <= 0:
-            return jsonify({'error': 'Area must be positive', 'status': 'error'}), 400
-        
+
+        is_valid, validated_data, errors = validate_recommendation_input(
+            data,
+            defaults={'rainfall': 120, 'temperature': 26, 'soil_type': 'sandy',
+                      'crop_type': 'maize', 'area': 5},
+        )
+        if not is_valid:
+            request_counter['errors'] += 1
+            return jsonify({'error': 'Validation failed', 'details': errors, 'status': 'error'}), 400
+
         engine = RecommendationEngine(use_advanced_fertilizer=True)
-        result = engine.get_recommendation(r, t, s, c, a)
-        
+        result = engine.get_recommendation(
+            validated_data['rainfall'], validated_data['temperature'],
+            validated_data['soil_type'], validated_data['crop_type'],
+            validated_data['area'],
+        )
+
         result['endpoint'] = 'advanced'
         result['fertilizer_algorithm'] = 'quantum-inspired'
         result['timestamp'] = datetime.now().isoformat()
-        
-        logger.info(f'Advanced recommendation for {c} (Area: {a}ha, Rainfall: {r}mm)')
-        
+
+        logger.info(
+            f'Advanced recommendation for {validated_data["crop_type"]} '
+            f'(Area: {validated_data["area"]}ha, Rainfall: {validated_data["rainfall"]}mm)'
+        )
+
         return jsonify(result)
-        
-    except ValueError as e:
-        request_counter['errors'] += 1
-        return jsonify({
-            'error': 'Invalid parameter type',
-            'message': str(e),
-            'status': 'error'
-        }), 400
+
     except Exception as e:
         request_counter['errors'] += 1
-        logger.error(f'Error in /recommend/advanced: {str(e)}')
+        # BEFORE: `str(e)` was returned directly to the client, leaking
+        # internal exception details (file paths, library internals) to
+        # anyone calling the API. Full detail is logged server-side only;
+        # the client gets a generic, safe message.
+        logger.error(f'Error in /recommend/advanced: {str(e)}', exc_info=True)
         return jsonify({
             'error': 'Internal server error',
             'status': 'error'
@@ -222,40 +266,47 @@ def recommend_advanced():
 def recommend_simple():
     request_counter['total'] += 1
     request_counter['simple'] += 1
-    
+
     try:
         data = request.get_json()
         if not data:
             return jsonify({'error': 'No JSON data provided', 'status': 'error'}), 400
-        
-        r = float(data.get('rainfall', 120))
-        t = float(data.get('temperature', 26))
-        s = data.get('soil_type', 'sandy').lower()
-        c = data.get('crop_type', 'maize').lower()
-        a = float(data.get('area', 5))
-        
+
+        is_valid, validated_data, errors = validate_recommendation_input(
+            data,
+            defaults={'rainfall': 120, 'temperature': 26, 'soil_type': 'sandy',
+                      'crop_type': 'maize', 'area': 5},
+        )
+        if not is_valid:
+            request_counter['errors'] += 1
+            return jsonify({'error': 'Validation failed', 'details': errors, 'status': 'error'}), 400
+
         engine = RecommendationEngine(use_advanced_fertilizer=False)
-        result = engine.get_recommendation(r, t, s, c, a)
-        
+        result = engine.get_recommendation(
+            validated_data['rainfall'], validated_data['temperature'],
+            validated_data['soil_type'], validated_data['crop_type'],
+            validated_data['area'],
+        )
+
         result['endpoint'] = 'simple'
         result['fertilizer_algorithm'] = 'linear-formula'
         result['timestamp'] = datetime.now().isoformat()
         result['note'] = 'Using simple formula for backward compatibility'
-        
-        logger.info(f'Simple recommendation for {c}')
-        
+
+        logger.info(f'Simple recommendation for {validated_data["crop_type"]}')
+
         return jsonify(result)
-        
+
     except Exception as e:
         request_counter['errors'] += 1
-        logger.error(f'Error in /recommend/simple: {str(e)}')
+        logger.error(f'Error in /recommend/simple: {str(e)}', exc_info=True)
         return jsonify({
             'error': 'Invalid request',
-            'message': str(e),
             'status': 'error'
         }), 400
 
 @app.route('/recommend/batch', methods=['POST'])
+@limiter.limit("5 per minute")
 def recommend_batch():
     request_counter['total'] += 1
     
@@ -278,22 +329,36 @@ def recommend_batch():
         
         for i, req in enumerate(requests):
             try:
-                r = float(req.get('rainfall', 120))
-                t = float(req.get('temperature', 26))
-                s = req.get('soil_type', 'sandy').lower()
-                c = req.get('crop_type', 'maize').lower()
-                a = float(req.get('area', 5))
-                
-                result = engine.get_recommendation(r, t, s, c, a)
+                is_valid, validated_data, errors = validate_recommendation_input(
+                    req,
+                    defaults={'rainfall': 120, 'temperature': 26, 'soil_type': 'sandy',
+                              'crop_type': 'maize', 'area': 5},
+                )
+                if not is_valid:
+                    results.append({
+                        'batch_index': i,
+                        'status': 'error',
+                        'error': 'Validation failed',
+                        'details': errors,
+                        'input_parameters': req,
+                    })
+                    continue
+
+                result = engine.get_recommendation(
+                    validated_data['rainfall'], validated_data['temperature'],
+                    validated_data['soil_type'], validated_data['crop_type'],
+                    validated_data['area'],
+                )
                 result['batch_index'] = i
                 result['input_parameters'] = req
                 results.append(result)
-                
+
             except Exception as e:
+                logger.error(f'Error in batch item {i}: {str(e)}', exc_info=True)
                 results.append({
                     'batch_index': i,
                     'status': 'error',
-                    'error': str(e),
+                    'error': 'Processing failed for this item',
                     'input_parameters': req
                 })
         
@@ -355,6 +420,7 @@ def metrics():
     })
 
 @app.route('/clear-cache', methods=['POST'])
+@limiter.limit("5 per hour")
 def clear_cache():
     global recommendation_cache
     cache_size = len(recommendation_cache)
@@ -435,15 +501,15 @@ def home():
                 '/': 'This documentation',
                 '/health': 'Health check',
                 '/metrics': 'API metrics',
-                '/supported': 'Supported parameters',
-                '/clear-cache': 'Clear cache (POST)'
+                '/supported': 'Supported parameters'
             },
             'POST': {
                 '/recommend': 'Get recommendation (default)',
                 '/recommend/advanced': 'Advanced quantum optimization',
                 '/recommend/simple': 'Simple formula',
                 '/recommend/batch': 'Batch processing',
-                '/validate-input': 'Validate input'
+                '/validate-input': 'Validate input',
+                '/clear-cache': 'Clear cache'
             }
         },
         'example_request': {
