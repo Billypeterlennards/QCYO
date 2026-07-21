@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from engine.recommendation_engine import RecommendationEngine
+from engine.recommendation_engine import RecommendationEngine, ML_AVAILABLE
 
 app = Flask(__name__)
 CORS(app)
@@ -46,7 +46,8 @@ request_counter = {
     'total': 0,
     'advanced': 0,
     'simple': 0,
-    'errors': 0
+    'errors': 0,
+    'cache_hits': 0,
 }
 
 # Validator for input parameters
@@ -228,7 +229,21 @@ def recommend():
         cache_key = get_cache_key(validated_data, budget)
         if cache_key in recommendation_cache:
             logger.info(f'Cache hit for key: {cache_key}')
-            result = recommendation_cache[cache_key]
+            request_counter['cache_hits'] += 1
+            # AUDIT FIX: previously mutated the cached dict in place
+            # (result = recommendation_cache[cache_key]; result['cached']
+            # = True) - since this is the SAME object reference stored in
+            # the cache, that permanently flipped the stored entry's
+            # 'cached' flag to True forever, even outside any request. As
+            # a result, /metrics' cache_hits calculation
+            # (counting entries with cached=True) only ever counted
+            # "distinct keys hit at least once", never a real cumulative
+            # hit count - hitting the same key 100 times still showed 1.
+            # Returning a shallow copy instead of the stored reference
+            # means we can still flag *this response* as served from
+            # cache without corrupting the stored entry, and the real
+            # hit count now comes from the counter above instead.
+            result = dict(recommendation_cache[cache_key])
             result['cached'] = True
             result['timestamp'] = datetime.now().isoformat()
             return jsonify(result)
@@ -375,10 +390,22 @@ def recommend_batch():
         data = request.get_json()
         if not data or 'requests' not in data:
             return jsonify({'error': 'No batch requests provided', 'status': 'error'}), 400
-        
+
         requests = data.get('requests', [])
-        use_advanced = data.get('advanced', True)
-        
+
+        # AUDIT FIX: 'advanced' was accepted with zero type validation -
+        # any truthy value (a string like "no", a number, an object) was
+        # silently treated as `True` by Python's truthiness rules, since
+        # data.get('advanced', True) never checked the actual type.
+        advanced_raw = data.get('advanced', True)
+        if not isinstance(advanced_raw, bool):
+            return jsonify({
+                'error': 'Validation failed',
+                'details': ["advanced: must be a boolean (true or false)"],
+                'status': 'error'
+            }), 400
+        use_advanced = advanced_raw
+
         if not isinstance(requests, list) or len(requests) > 50:
             return jsonify({
                 'error': 'Requests must be a list (max 50 items)',
@@ -405,10 +432,28 @@ def recommend_batch():
                     })
                     continue
 
+                # AUDIT FIX: every other recommendation endpoint
+                # (/recommend, /recommend/advanced, /recommend/simple)
+                # already extracts and honors a per-request 'budget'
+                # field - this endpoint alone still silently dropped it
+                # for every batch item, identical to the bug already
+                # fixed elsewhere, just not yet propagated here.
+                budget_valid, item_budget, budget_error = extract_optional_budget(req)
+                if not budget_valid:
+                    results.append({
+                        'batch_index': i,
+                        'status': 'error',
+                        'error': 'Validation failed',
+                        'details': [budget_error],
+                        'input_parameters': req,
+                    })
+                    continue
+
                 result = engine.get_recommendation(
                     validated_data['rainfall'], validated_data['temperature'],
                     validated_data['soil_type'], validated_data['crop_type'],
                     validated_data['area'],
+                    budget=item_budget,
                 )
                 result['batch_index'] = i
                 result['input_parameters'] = req
@@ -434,30 +479,51 @@ def recommend_batch():
         
     except Exception as e:
         request_counter['errors'] += 1
-        logger.error(f'Error in /recommend/batch: {str(e)}')
+        # AUDIT FIX: this leaked raw exception text to the client
+        # (verified live: a malformed request body leaked Werkzeug's
+        # internal parser error message) - the exact information-
+        # disclosure bug already fixed on /recommend, /recommend/advanced,
+        # and /recommend/simple in an earlier pass, but missed on this
+        # endpoint's outer handler. Full detail is logged server-side
+        # only; the client gets a generic, safe message.
+        logger.error(f'Error in /recommend/batch: {str(e)}', exc_info=True)
         return jsonify({
             'error': 'Batch processing failed',
-            'message': str(e),
             'status': 'error'
         }), 500
 
 @app.route('/health', methods=['GET'])
 def health():
-    engine = RecommendationEngine()
-    test_result = engine.get_recommendation(120, 26, 'sandy', 'maize', 1.0)
-    
+    # AUDIT FIX: previously called engine.get_recommendation(...) (the
+    # FULL ML + quantum optimization pipeline) just to populate this
+    # status check, then read a key called 'ml_model_available' from its
+    # response - which never existed (verified live: this always
+    # returned False even with the ML model genuinely loaded and
+    # working, since the real key the engine returns is 'ml_model_used').
+    # Using the real ML_AVAILABLE flag directly is both correct and far
+    # cheaper - no need to run a full recommendation just to check status,
+    # which also means this endpoint stays fast and reliable even if the
+    # service is under heavy load (the worst time for a health check to
+    # itself become slow).
+    try:
+        engine = RecommendationEngine()
+        engine_ok = True
+    except Exception as e:
+        logger.error(f'Engine failed to initialize during health check: {e}', exc_info=True)
+        engine_ok = False
+
     health_status = {
-        'status': 'healthy' if test_result.get('status') == 'success' else 'degraded',
+        'status': 'healthy' if engine_ok else 'degraded',
         'timestamp': datetime.now().isoformat(),
         'service': 'Q-CYO Backend',
         'version': '1.0.0',
-        'engine_status': test_result.get('status', 'unknown'),
-        'ml_model_available': test_result.get('ml_model_available', False),
+        'engine_status': 'success' if engine_ok else 'error',
+        'ml_model_available': ML_AVAILABLE,
         'requests_processed': request_counter['total'],
         'cache_size': len(recommendation_cache),
         'memory_usage': f'{len(recommendation_cache) * 0.5:.1f}KB (estimated)'
     }
-    
+
     return jsonify(health_status)
 
 @app.route('/metrics', methods=['GET'])
@@ -474,7 +540,7 @@ def metrics():
             'requests_simple': request_counter['simple'],
             'errors_total': errors,
             'success_rate': f'{success_rate:.1f}%',
-            'cache_hits': len([v for v in recommendation_cache.values() if v.get('cached', False)]),
+            'cache_hits': request_counter['cache_hits'],
             'cache_size': len(recommendation_cache)
         },
         'timestamp': datetime.now().isoformat()
@@ -521,9 +587,10 @@ def validate_input_endpoint():
         })
         
     except Exception as e:
+        logger.error(f'Error in /validate-input: {str(e)}', exc_info=True)
         return jsonify({
             'status': 'error',
-            'error': str(e)
+            'error': 'Invalid request'
         }), 400
 
 @app.route('/supported', methods=['GET'])
