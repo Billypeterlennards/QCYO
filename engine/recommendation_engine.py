@@ -5,8 +5,6 @@ import random
 import math
 from datetime import datetime
 import joblib
-import pandas as pd
-import numpy as np
 
 # Add models to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -14,28 +12,72 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # ---------- YIELD PREDICTION ----------
 print("🤖 Loading ML yield model...")
 
+# AUDIT FIX (critical, verified bug): the previous predict_yield_ml()
+# built its feature row via ad-hoc keyword-matching on feature NAMES
+# ('rain' in name.lower(), 'soil' in name.lower(), ...) and fed raw
+# strings like "sandy"/"maize" directly into a numeric model. The model
+# actually committed to this repo, meanwhile, turned out to have been
+# trained on a completely different, unrelated dataset (114 one-hot
+# columns from a global per-country crop dataset) - verified empirically
+# that every real prediction attempt threw an exception, was silently
+# caught, and fell back to the formula. The API's `ml_model_used: true`
+# was therefore misleading in every single request.
+#
+# Fixed at the root: train_model.py now trains on this project's own
+# real dataset (data/crop_yield.csv) using the SAME shared encoding
+# function this file now calls at inference time - see
+# utils/preprocess.py's module docstring for the full explanation of why
+# a single shared encoder (not two independently-maintained encodings)
+# is the actual fix, not just a patch.
+from utils.preprocess import encode_features
+
 def load_ml_model():
-    """Load the trained ML model"""
+    """Load the trained ML model and its matching feature column list."""
     try:
         model_path = 'saved_models/yield_model.pkl'
-        if os.path.exists(model_path):
-            model = joblib.load(model_path)
-            print(f"✅ ML model loaded from {model_path}")
-            
-            # Try to load feature names
-            feature_path = 'saved_models/feature_names.pkl'
-            if os.path.exists(feature_path):
-                feature_names = joblib.load(feature_path)
-                print(f"✅ Feature names loaded: {len(feature_names)} features")
-            else:
-                # Default feature names
-                feature_names = ['Rainfall', 'Temperature', 'Soil_Type', 'Crop_Type']
-                print("⚠️ Using default feature names")
-            
-            return model, feature_names
-        else:
+        feature_path = 'saved_models/feature_names.pkl'
+
+        if not os.path.exists(model_path):
             print(f"⚠️ Model file not found: {model_path}")
             return None, None
+
+        if not os.path.exists(feature_path):
+            # BEFORE: this silently fell back to a hardcoded, generic
+            # 4-name list ('Rainfall', 'Temperature', 'Soil_Type',
+            # 'Crop_Type') that never matched what any real trained
+            # model actually expects (one-hot encoded columns, not raw
+            # category names) - the root cause of the ML path always
+            # failing. A missing feature_names.pkl means the model
+            # artifact is incomplete/mismatched; refusing to load it (and
+            # falling back to the formula predictor, which is always
+            # available) is the correct, honest behavior instead of
+            # guessing at a feature schema that's virtually guaranteed to
+            # be wrong.
+            print(
+                f"⚠️ {feature_path} not found - model artifact is incomplete, "
+                f"refusing to load (would produce silently wrong predictions). "
+                f"Run train_model.py to regenerate both files together."
+            )
+            return None, None
+
+        model = joblib.load(model_path)
+        feature_names = joblib.load(feature_path)
+
+        if getattr(model, "n_features_in_", None) != len(feature_names):
+            # Real defensive check: catches exactly the kind of
+            # mismatched-artifact bug that caused this whole issue,
+            # instead of deferring the failure to the first prediction
+            # request (or worse, silently producing a wrong number).
+            print(
+                f"⚠️ Model expects {getattr(model, 'n_features_in_', '?')} features "
+                f"but feature_names.pkl has {len(feature_names)} - mismatched "
+                f"artifacts, refusing to load."
+            )
+            return None, None
+
+        print(f"✅ ML model loaded from {model_path} ({len(feature_names)} features)")
+        return model, feature_names
+
     except Exception as e:
         print(f"❌ Error loading ML model: {e}")
         return None, None
@@ -45,55 +87,26 @@ ml_model, feature_names = load_ml_model()
 ML_AVAILABLE = ml_model is not None
 
 def predict_yield_ml(rainfall, temperature, soil_type, crop_type):
-    """Make prediction using the trained ML model"""
+    """Make prediction using the trained ML model, via the single shared encoder."""
     try:
-        # Map inputs to feature values
-        feature_dict = {}
-        
-        # Map based on actual feature names
-        for feature in feature_names:
-            feature_lower = feature.lower()
-            
-            if any(keyword in feature_lower for keyword in ['rain', 'precip', 'water']):
-                feature_dict[feature] = rainfall
-            elif any(keyword in feature_lower for keyword in ['temp', 'temperature', 'heat']):
-                feature_dict[feature] = temperature
-            elif any(keyword in feature_lower for keyword in ['soil', 'dirt', 'earth']):
-                feature_dict[feature] = soil_type
-            elif any(keyword in feature_lower for keyword in ['crop', 'plant', 'variety']):
-                feature_dict[feature] = crop_type
-            else:
-                # Set sensible defaults for other features
-                if 'ph' in feature_lower:
-                    feature_dict[feature] = 6.5  # Neutral pH
-                elif any(keyword in feature_lower for keyword in ['organic', 'matter', 'carbon']):
-                    feature_dict[feature] = 2.0  # 2% organic matter
-                elif any(keyword in feature_lower for keyword in ['nitrogen', 'n_']):
-                    feature_dict[feature] = 50.0  # Medium nitrogen level
-                elif any(keyword in feature_lower for keyword in ['phosphorus', 'p_', 'phosphate']):
-                    feature_dict[feature] = 30.0  # Medium phosphorus
-                elif any(keyword in feature_lower for keyword in ['potassium', 'k_', 'potash']):
-                    feature_dict[feature] = 40.0  # Medium potassium
-                elif 'altitude' in feature_lower or 'elevation' in feature_lower:
-                    feature_dict[feature] = 100.0  # 100m altitude
-                else:
-                    feature_dict[feature] = 0.0  # Default for unknown features
-        
-        # Create DataFrame
-        input_data = pd.DataFrame([feature_dict])[feature_names]
-        
-        # Make prediction
+        input_data = encode_features(rainfall, temperature, soil_type, crop_type)
+        # Reorder columns to exactly match what the model was trained
+        # on. encode_features() and feature_names.pkl are both derived
+        # from the same source (utils.preprocess), so this is a pure
+        # reordering, never a schema mismatch.
+        input_data = input_data[feature_names]
+
         prediction = ml_model.predict(input_data)
         predicted_yield = float(prediction[0])
-        
+
         # Ensure reasonable bounds
         if predicted_yield < 0:
             predicted_yield = 0.5
         elif predicted_yield > 50:
             predicted_yield = min(predicted_yield, 30.0)
-        
+
         return round(predicted_yield, 2), 'trained_ml_model'
-        
+
     except Exception as e:
         print(f"❌ ML prediction failed: {e}")
         return None
