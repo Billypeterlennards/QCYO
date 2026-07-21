@@ -95,6 +95,45 @@ class InputValidator:
         except:
             return False, 'Area must be a number'
 
+    @staticmethod
+    def validate_budget(value):
+        try:
+            val = float(value)
+            if val <= 0:
+                return False, 'Budget must be a positive number'
+            return True, val
+        except:
+            return False, 'Budget must be a number'
+
+
+def extract_optional_budget(data):
+    """
+    AUDIT FIX (critical, systemic gap): budget was accepted by NONE of
+    /recommend, /recommend/advanced, or /recommend/simple - not because
+    of a validation bug, but because the field was never extracted from
+    the request or passed to engine.get_recommendation() at all, on any
+    endpoint. The engine itself fully implements budget-constrained
+    quantum optimization (see engine/recommendation_engine.py's
+    quantum_fertilizer_optimization), and the Flutter client already
+    sends a `budget` field from its "Advanced Options" form section - but
+    every request silently had it dropped on the floor server-side.
+    Verified live: submitting budget=100 (guaranteed to be exceeded) and
+    budget=2000 (guaranteed to be respected) both produced a response
+    with no budget_constraint_usd/within_budget/budget_utilization_percent
+    fields whatsoever, for either case.
+
+    This is the single, shared extraction point every endpoint below now
+    calls, instead of four independent (and, until now, entirely missing)
+    implementations - `budget` is optional, so a missing field is not an
+    error, unlike the required fields validated by validate_input().
+    """
+    if 'budget' not in data or data['budget'] is None:
+        return True, None, None
+    is_valid, result = InputValidator.validate_budget(data['budget'])
+    if not is_valid:
+        return False, None, f'budget: {result}'
+    return True, result, None
+
 def validate_input(data, required_fields):
     errors = []
     validated = {}
@@ -112,8 +151,8 @@ def validate_input(data, required_fields):
     
     return len(errors) == 0, validated, errors
 
-def get_cache_key(params):
-    return f'{params.get("rainfall")}_{params.get("temperature")}_{params.get("soil_type")}_{params.get("crop_type")}_{params.get("area")}'
+def get_cache_key(params, budget=None):
+    return f'{params.get("rainfall")}_{params.get("temperature")}_{params.get("soil_type")}_{params.get("crop_type")}_{params.get("area")}_{budget}'
 
 # BEFORE: /recommend/advanced, /recommend/simple, and /recommend/batch each
 # did their own raw `float(data.get(...))` extraction with ZERO range or
@@ -176,22 +215,32 @@ def recommend():
                 'details': errors,
                 'status': 'error'
             }), 400
-        
-        cache_key = get_cache_key(validated_data)
+
+        budget_valid, budget, budget_error = extract_optional_budget(data)
+        if not budget_valid:
+            request_counter['errors'] += 1
+            return jsonify({
+                'error': 'Validation failed',
+                'details': [budget_error],
+                'status': 'error'
+            }), 400
+
+        cache_key = get_cache_key(validated_data, budget)
         if cache_key in recommendation_cache:
             logger.info(f'Cache hit for key: {cache_key}')
             result = recommendation_cache[cache_key]
             result['cached'] = True
             result['timestamp'] = datetime.now().isoformat()
             return jsonify(result)
-        
+
         engine = RecommendationEngine(use_advanced_fertilizer=True)
         result = engine.get_recommendation(
             validated_data['rainfall'],
             validated_data['temperature'],
             validated_data['soil_type'],
             validated_data['crop_type'],
-            validated_data['area']
+            validated_data['area'],
+            budget=budget
         )
         
         result['timestamp'] = datetime.now().isoformat()
@@ -232,11 +281,17 @@ def recommend_advanced():
             request_counter['errors'] += 1
             return jsonify({'error': 'Validation failed', 'details': errors, 'status': 'error'}), 400
 
+        budget_valid, budget, budget_error = extract_optional_budget(data)
+        if not budget_valid:
+            request_counter['errors'] += 1
+            return jsonify({'error': 'Validation failed', 'details': [budget_error], 'status': 'error'}), 400
+
         engine = RecommendationEngine(use_advanced_fertilizer=True)
         result = engine.get_recommendation(
             validated_data['rainfall'], validated_data['temperature'],
             validated_data['soil_type'], validated_data['crop_type'],
             validated_data['area'],
+            budget=budget,
         )
 
         result['endpoint'] = 'advanced'
@@ -281,11 +336,17 @@ def recommend_simple():
             request_counter['errors'] += 1
             return jsonify({'error': 'Validation failed', 'details': errors, 'status': 'error'}), 400
 
+        budget_valid, budget, budget_error = extract_optional_budget(data)
+        if not budget_valid:
+            request_counter['errors'] += 1
+            return jsonify({'error': 'Validation failed', 'details': [budget_error], 'status': 'error'}), 400
+
         engine = RecommendationEngine(use_advanced_fertilizer=False)
         result = engine.get_recommendation(
             validated_data['rainfall'], validated_data['temperature'],
             validated_data['soil_type'], validated_data['crop_type'],
             validated_data['area'],
+            budget=budget,
         )
 
         result['endpoint'] = 'simple'
